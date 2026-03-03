@@ -1,129 +1,12 @@
 package handlers
 
 import (
-	"crypto/rand"
 	"fmt"
-	"math/big"
 	"net/http"
-	"sync"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/nebari-dev/nebi/internal/auth"
 )
-
-// Device code store — in-memory, no external dependencies.
-
-const (
-	deviceCodeTTL     = 5 * time.Minute
-	deviceCodeCleanup = 60 * time.Second
-	deviceCodeLength  = 8 // e.g., "ABCD-1234"
-)
-
-type deviceCodeEntry struct {
-	code      string
-	token     string
-	username  string
-	completed bool
-	expiresAt time.Time
-}
-
-type deviceCodeStore struct {
-	mu      sync.Mutex
-	entries map[string]*deviceCodeEntry
-}
-
-var defaultCodeStore = newDeviceCodeStore()
-
-func newDeviceCodeStore() *deviceCodeStore {
-	s := &deviceCodeStore{
-		entries: make(map[string]*deviceCodeEntry),
-	}
-	go s.cleanupLoop()
-	return s
-}
-
-func (s *deviceCodeStore) cleanupLoop() {
-	ticker := time.NewTicker(deviceCodeCleanup)
-	defer ticker.Stop()
-	for range ticker.C {
-		s.mu.Lock()
-		now := time.Now()
-		for code, entry := range s.entries {
-			if now.After(entry.expiresAt) {
-				delete(s.entries, code)
-			}
-		}
-		s.mu.Unlock()
-	}
-}
-
-// Generate creates a new device code and stores it.
-func (s *deviceCodeStore) Generate() (string, error) {
-	code, err := generateCode()
-	if err != nil {
-		return "", err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.entries[code] = &deviceCodeEntry{
-		code:      code,
-		expiresAt: time.Now().Add(deviceCodeTTL),
-	}
-	return code, nil
-}
-
-// Complete marks a device code as completed with the auth result.
-func (s *deviceCodeStore) Complete(code, token, username string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entry, ok := s.entries[code]
-	if !ok || time.Now().After(entry.expiresAt) {
-		return false
-	}
-	entry.token = token
-	entry.username = username
-	entry.completed = true
-	return true
-}
-
-// Poll checks the status of a device code.
-func (s *deviceCodeStore) Poll(code string) (token, username string, found, completed bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entry, ok := s.entries[code]
-	if !ok || time.Now().After(entry.expiresAt) {
-		return "", "", false, false
-	}
-	return entry.token, entry.username, true, entry.completed
-}
-
-// generateCode creates a code like "ABCD-1234" (4 uppercase letters + 4 digits).
-func generateCode() (string, error) {
-	const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ" // no I, O (avoid confusion with 1, 0)
-	const digits = "0123456789"
-
-	code := make([]byte, 9) // 4 letters + dash + 4 digits
-	for i := 0; i < 4; i++ {
-		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-		if err != nil {
-			return "", err
-		}
-		code[i] = letters[n.Int64()]
-	}
-	code[4] = '-'
-	for i := 5; i < 9; i++ {
-		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(digits))))
-		if err != nil {
-			return "", err
-		}
-		code[i] = digits[n.Int64()]
-	}
-	return string(code), nil
-}
-
-// --- Handlers ---
 
 // CLILoginCode godoc
 // @Summary Request a device code for CLI login
@@ -132,16 +15,16 @@ func generateCode() (string, error) {
 // @Produce json
 // @Success 200 {object} map[string]interface{}
 // @Router /auth/cli-login/code [post]
-func CLILoginCode() gin.HandlerFunc {
+func CLILoginCode(store *auth.DeviceCodeStore) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		code, err := defaultCodeStore.Generate()
+		code, err := store.Generate()
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate code"})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{
 			"code":       code,
-			"expires_in": int(deviceCodeTTL.Seconds()),
+			"expires_in": store.TTLSeconds(),
 		})
 	}
 }
@@ -156,7 +39,7 @@ func CLILoginCode() gin.HandlerFunc {
 // @Success 200 {string} string "HTML page"
 // @Failure 400 {object} map[string]string
 // @Router /auth/cli-login [get]
-func CLILogin(basicAuth *auth.BasicAuthenticator, proxyAdminGroups string) gin.HandlerFunc {
+func CLILogin(basicAuth *auth.BasicAuthenticator, proxyAdminGroups string, store *auth.DeviceCodeStore) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		code := c.Query("code")
 		if code == "" {
@@ -165,7 +48,7 @@ func CLILogin(basicAuth *auth.BasicAuthenticator, proxyAdminGroups string) gin.H
 		}
 
 		// Verify the code exists and hasn't expired
-		_, _, found, completed := defaultCodeStore.Poll(code)
+		_, _, found, completed := store.Poll(code)
 		if !found {
 			c.JSON(http.StatusNotFound, gin.H{"error": "unknown or expired code"})
 			return
@@ -178,7 +61,7 @@ func CLILogin(basicAuth *auth.BasicAuthenticator, proxyAdminGroups string) gin.H
 		// Try proxy session first (OIDC proxy sets an IdToken cookie)
 		resp, err := basicAuth.SessionFromProxy(c.Request, proxyAdminGroups)
 		if err == nil {
-			defaultCodeStore.Complete(code, resp.Token, resp.User.Username)
+			store.Complete(code, resp.Token, resp.User.Username)
 			renderCLISuccess(c)
 			return
 		}
@@ -193,7 +76,7 @@ func CLILogin(basicAuth *auth.BasicAuthenticator, proxyAdminGroups string) gin.H
 				return
 			}
 
-			defaultCodeStore.Complete(code, loginResp.Token, loginResp.User.Username)
+			store.Complete(code, loginResp.Token, loginResp.User.Username)
 			renderCLISuccess(c)
 			return
 		}
@@ -212,7 +95,7 @@ func CLILogin(basicAuth *auth.BasicAuthenticator, proxyAdminGroups string) gin.H
 // @Success 200 {object} map[string]interface{}
 // @Failure 404 {object} map[string]string
 // @Router /auth/cli-login/poll [get]
-func CLILoginPoll() gin.HandlerFunc {
+func CLILoginPoll(store *auth.DeviceCodeStore) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		code := c.Query("code")
 		if code == "" {
@@ -220,7 +103,7 @@ func CLILoginPoll() gin.HandlerFunc {
 			return
 		}
 
-		token, username, found, completed := defaultCodeStore.Poll(code)
+		token, username, found, completed := store.Poll(code)
 		if !found {
 			c.JSON(http.StatusNotFound, gin.H{"error": "unknown or expired code"})
 			return

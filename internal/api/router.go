@@ -111,11 +111,12 @@ func NewRouter(cfg *config.Config, db *gorm.DB, q queue.Queue, exec executor.Exe
 		public.GET("/auth/session", handlers.SessionCheck(sessionBasicAuth, cfg.Auth.ProxyAdminGroups))
 
 		// CLI login: device code flow for browser-based CLI authentication.
-		cliLoginHandler := handlers.CLILogin(sessionBasicAuth, cfg.Auth.ProxyAdminGroups)
-		public.POST("/auth/cli-login/code", handlers.CLILoginCode())
+		cliCodeStore := auth.NewDeviceCodeStore()
+		cliLoginHandler := handlers.CLILogin(sessionBasicAuth, cfg.Auth.ProxyAdminGroups, cliCodeStore)
+		public.POST("/auth/cli-login/code", handlers.CLILoginCode(cliCodeStore))
 		public.GET("/auth/cli-login", cliLoginHandler)
 		public.POST("/auth/cli-login", cliLoginHandler)
-		public.GET("/auth/cli-login/poll", handlers.CLILoginPoll())
+		public.GET("/auth/cli-login/poll", handlers.CLILoginPoll(cliCodeStore))
 
 		// OIDC routes (if enabled, team mode only)
 		if oidcAuth != nil {
