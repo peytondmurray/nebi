@@ -5,7 +5,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/nebari-dev/nebi/internal/cliclient"
 	"github.com/nebari-dev/nebi/internal/store"
@@ -25,13 +28,16 @@ var loginCmd = &cobra.Command{
 	Long: `Sets the server URL and authenticates with a nebi server.
 
 Examples:
-  # Interactive - prompts for username and password
+  # Browser login (default) — opens browser, works with proxy/Keycloak
   nebi login https://nebi.company.com
 
-  # Non-interactive with username flag and password from stdin
+  # Username/password login
+  nebi login https://nebi.company.com --username myuser
+
+  # Non-interactive with password from stdin
   echo "$PASSWORD" | nebi login https://nebi.company.com --username myuser --password-stdin
 
-  # Using an API token (skips username/password)
+  # Using an API token (skips interactive login)
   nebi login https://nebi.company.com --token <api-token>`,
 	Args: cobra.ExactArgs(1),
 	RunE: runLogin,
@@ -39,8 +45,8 @@ Examples:
 
 func init() {
 	loginCmd.Flags().StringVar(&loginToken, "token", "", "API token (skip interactive login)")
-	loginCmd.Flags().StringVarP(&loginUsername, "username", "u", "", "Username for authentication")
-	loginCmd.Flags().BoolVar(&loginPasswordStdin, "password-stdin", false, "Read password from stdin")
+	loginCmd.Flags().StringVarP(&loginUsername, "username", "u", "", "Username/password login (prompts for password)")
+	loginCmd.Flags().BoolVar(&loginPasswordStdin, "password-stdin", false, "Read password from stdin (requires --username)")
 }
 
 func runLogin(cmd *cobra.Command, args []string) error {
@@ -62,25 +68,14 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	var username string
 
 	if loginToken != "" {
+		// Direct token mode
 		token = loginToken
 		username = "(token)"
-	} else {
-		var user string
+	} else if loginUsername != "" {
+		// Username/password mode
 		var password string
 
-		// Get username
-		if loginUsername != "" {
-			user = loginUsername
-		} else {
-			fmt.Fprint(os.Stderr, "Username: ")
-			if _, err := fmt.Scanln(&user); err != nil {
-				return fmt.Errorf("reading username: %w", err)
-			}
-		}
-
-		// Get password
 		if loginPasswordStdin {
-			// Read password from stdin (for scripting)
 			scanner := bufio.NewScanner(os.Stdin)
 			if scanner.Scan() {
 				password = scanner.Text()
@@ -89,7 +84,6 @@ func runLogin(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("reading password from stdin: %w", err)
 			}
 		} else if term.IsTerminal(int(os.Stdin.Fd())) {
-			// Interactive prompt
 			fmt.Fprint(os.Stderr, "Password: ")
 			passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 			fmt.Fprintln(os.Stderr)
@@ -102,13 +96,21 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		}
 
 		client := cliclient.NewWithoutAuth(serverURL)
-		resp, err := client.Login(context.Background(), user, password)
+		resp, err := client.Login(context.Background(), loginUsername, password)
 		if err != nil {
 			return fmt.Errorf("login failed: %w", err)
 		}
 
 		token = resp.Token
-		username = user
+		username = loginUsername
+	} else {
+		// Default: browser-based device code login
+		t, u, err := browserLogin(serverURL)
+		if err != nil {
+			return fmt.Errorf("browser login failed: %w", err)
+		}
+		token = t
+		username = u
 	}
 
 	s, err := store.New()
@@ -127,4 +129,62 @@ func runLogin(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "Logged in to %s as %s\n", serverURL, username)
 	return nil
+}
+
+// browserLogin performs browser-based authentication using a device code flow.
+// It requests a short code from the server, opens the browser, and polls for completion.
+func browserLogin(serverURL string) (token, username string, err error) {
+	ctx := context.Background()
+	client := cliclient.NewWithoutAuth(serverURL)
+
+	// Request a device code
+	codeResp, err := client.RequestDeviceCode(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to request device code: %w", err)
+	}
+
+	// Build the login URL
+	loginURL := fmt.Sprintf("%s/api/v1/auth/cli-login?code=%s", serverURL, codeResp.Code)
+
+	fmt.Fprintf(os.Stderr, "Opening browser for authentication...\n")
+	fmt.Fprintf(os.Stderr, "If the browser doesn't open, visit:\n  %s\n\n", loginURL)
+	fmt.Fprintf(os.Stderr, "Your login code is: %s\n\n", codeResp.Code)
+
+	// Open browser
+	if err := openBrowser(loginURL); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not open browser: %v\n", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "Waiting for authentication...\n")
+
+	// Poll for completion
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+
+		pollResp, pollErr := client.PollDeviceCode(ctx, codeResp.Code)
+		if pollErr != nil {
+			continue // transient error, keep polling
+		}
+
+		if pollResp.Status == "complete" {
+			return pollResp.Token, pollResp.Username, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("timed out waiting for browser authentication (5 minutes)")
+}
+
+// openBrowser opens the given URL in the user's default browser.
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default: // linux, freebsd, etc.
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
 }
