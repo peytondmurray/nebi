@@ -20,7 +20,6 @@ var (
 	loginToken         string
 	loginUsername      string
 	loginPasswordStdin bool
-	loginBrowser       bool
 )
 
 var loginCmd = &cobra.Command{
@@ -29,16 +28,16 @@ var loginCmd = &cobra.Command{
 	Long: `Sets the server URL and authenticates with a nebi server.
 
 Examples:
-  # Interactive - prompts for username and password
+  # Browser login (default) — opens browser, works with proxy/Keycloak
   nebi login https://nebi.company.com
 
-  # Browser-based login (required when behind an OIDC proxy like Keycloak)
-  nebi login https://nebi.company.com --browser
+  # Username/password login
+  nebi login https://nebi.company.com --username myuser
 
-  # Non-interactive with username flag and password from stdin
+  # Non-interactive with password from stdin
   echo "$PASSWORD" | nebi login https://nebi.company.com --username myuser --password-stdin
 
-  # Using an API token (skips username/password)
+  # Using an API token (skips interactive login)
   nebi login https://nebi.company.com --token <api-token>`,
 	Args: cobra.ExactArgs(1),
 	RunE: runLogin,
@@ -46,9 +45,8 @@ Examples:
 
 func init() {
 	loginCmd.Flags().StringVar(&loginToken, "token", "", "API token (skip interactive login)")
-	loginCmd.Flags().StringVarP(&loginUsername, "username", "u", "", "Username for authentication")
-	loginCmd.Flags().BoolVar(&loginPasswordStdin, "password-stdin", false, "Read password from stdin")
-	loginCmd.Flags().BoolVar(&loginBrowser, "browser", false, "Login via browser (for servers behind OIDC proxy)")
+	loginCmd.Flags().StringVarP(&loginUsername, "username", "u", "", "Username/password login (prompts for password)")
+	loginCmd.Flags().BoolVar(&loginPasswordStdin, "password-stdin", false, "Read password from stdin (requires --username)")
 }
 
 func runLogin(cmd *cobra.Command, args []string) error {
@@ -59,12 +57,6 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	}
 
 	// Validate flag combinations
-	if loginBrowser && loginToken != "" {
-		return fmt.Errorf("cannot use --browser with --token")
-	}
-	if loginBrowser && loginPasswordStdin {
-		return fmt.Errorf("cannot use --browser with --password-stdin")
-	}
 	if loginPasswordStdin && loginToken != "" {
 		return fmt.Errorf("cannot use --password-stdin with --token")
 	}
@@ -75,34 +67,15 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	var token string
 	var username string
 
-	if loginBrowser {
-		// Browser-based login for servers behind OIDC proxies
-		t, u, err := browserLogin(serverURL)
-		if err != nil {
-			return fmt.Errorf("browser login failed: %w", err)
-		}
-		token = t
-		username = u
-	} else if loginToken != "" {
+	if loginToken != "" {
+		// Direct token mode
 		token = loginToken
 		username = "(token)"
-	} else {
-		var user string
+	} else if loginUsername != "" {
+		// Username/password mode
 		var password string
 
-		// Get username
-		if loginUsername != "" {
-			user = loginUsername
-		} else {
-			fmt.Fprint(os.Stderr, "Username: ")
-			if _, err := fmt.Scanln(&user); err != nil {
-				return fmt.Errorf("reading username: %w", err)
-			}
-		}
-
-		// Get password
 		if loginPasswordStdin {
-			// Read password from stdin (for scripting)
 			scanner := bufio.NewScanner(os.Stdin)
 			if scanner.Scan() {
 				password = scanner.Text()
@@ -111,7 +84,6 @@ func runLogin(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("reading password from stdin: %w", err)
 			}
 		} else if term.IsTerminal(int(os.Stdin.Fd())) {
-			// Interactive prompt
 			fmt.Fprint(os.Stderr, "Password: ")
 			passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 			fmt.Fprintln(os.Stderr)
@@ -124,17 +96,21 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		}
 
 		client := cliclient.NewWithoutAuth(serverURL)
-		resp, err := client.Login(context.Background(), user, password)
+		resp, err := client.Login(context.Background(), loginUsername, password)
 		if err != nil {
-			// Detect OIDC proxy redirect: the server returned HTML instead of JSON
-			if cliclient.IsOIDCRedirect(err) {
-				return fmt.Errorf("login failed: server appears to be behind an OIDC proxy (Keycloak/Envoy).\nUse browser-based login instead:\n\n  nebi login %s --browser", serverURL)
-			}
 			return fmt.Errorf("login failed: %w", err)
 		}
 
 		token = resp.Token
-		username = user
+		username = loginUsername
+	} else {
+		// Default: browser-based device code login
+		t, u, err := browserLogin(serverURL)
+		if err != nil {
+			return fmt.Errorf("browser login failed: %w", err)
+		}
+		token = t
+		username = u
 	}
 
 	s, err := store.New()
