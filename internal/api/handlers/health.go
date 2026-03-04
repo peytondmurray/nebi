@@ -25,6 +25,6 @@ func HealthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, HealthResponse{
 		Status:    "healthy",
 		Timestamp: time.Now(),
-		Version:   "1.0.0",
+		Version:   Version,
 	})
 }

@@ -28,9 +28,10 @@ COPY --from=frontend-builder /app/frontend/dist ./internal/web/dist
 RUN swag init -g cmd/nebi/main.go -o ./docs --exclude output
 
 # Build pure Go binary with CGO disabled
+ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath \
-    -ldflags '-s -w -X main.Version=latest' \
+    -ldflags "-s -w -X main.Version=${VERSION}" \
     -o /nebi ./cmd/nebi
 
 # Stage 3: Final image with pixi
